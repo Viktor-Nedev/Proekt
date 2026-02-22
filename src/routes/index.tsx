@@ -124,7 +124,15 @@ const STORAGE_KEY = "claryx_prefs";
 function loadPrefs(): UserPrefs {
 	try {
 		const raw = localStorage.getItem(STORAGE_KEY);
-		if (raw) return { ...DEFAULT_PREFS, ...(JSON.parse(raw) as Partial<UserPrefs>) };
+		if (raw) {
+			const parsed = JSON.parse(raw) as Partial<UserPrefs>;
+			// Merge shortcuts with defaults so new shortcuts (Alt+M, Alt+R) always apply
+			const mergedShortcuts = { ...DEFAULT_PREFS.shortcuts, ...(parsed.shortcuts ?? {}) };
+			// Always enforce correct defaults for magnifier and reading shortcuts
+			mergedShortcuts.magnifier = mergedShortcuts.magnifier || "Alt+M";
+			mergedShortcuts.reading = mergedShortcuts.reading || "Alt+R";
+			return { ...DEFAULT_PREFS, ...parsed, shortcuts: mergedShortcuts };
+		}
 	} catch {
 		// ignore parse errors
 	}
@@ -230,15 +238,25 @@ function speakSmooth(
 ) {
 	speechSynthesis.cancel();
 
-	const sentences = text
+	// Split text into sentences, but track their offsets in the original text
+	const rawSentences = text
 		.replace(/([.!?])\s+/g, "$1\n")
 		.split("\n")
 		.map((s) => s.trim())
 		.filter(Boolean);
 
-	if (sentences.length === 0) {
+	if (rawSentences.length === 0) {
 		onDone();
 		return;
+	}
+
+	// Build sentence start offsets so we can map sentence-relative charIndex to full-text position
+	const sentenceOffsets: number[] = [];
+	let searchFrom = 0;
+	for (const sentence of rawSentences) {
+		const pos = text.indexOf(sentence, searchFrom);
+		sentenceOffsets.push(pos >= 0 ? pos : searchFrom);
+		searchFrom = pos >= 0 ? pos + sentence.length : searchFrom + sentence.length;
 	}
 
 	const preferredKeywords = ["natural", "enhanced", "neural", "premium", "google", "microsoft"];
@@ -258,11 +276,15 @@ function speakSmooth(
 	let idx = 0;
 
 	function speakNext() {
-		if (idx >= sentences.length) {
+		if (idx >= rawSentences.length) {
 			onDone();
 			return;
 		}
-		const utter = new SpeechSynthesisUtterance(sentences[idx]);
+		const currentIdx = idx;
+		const sentence = rawSentences[currentIdx];
+		const sentenceOffset = sentenceOffsets[currentIdx];
+
+		const utter = new SpeechSynthesisUtterance(sentence);
 		utter.rate = speed;
 		utter.lang = lang;
 		utter.pitch = 1.05;
@@ -270,7 +292,12 @@ function speakSmooth(
 
 		if (onWord) {
 			utter.onboundary = (e) => {
-				if (e.name === "word") onWord(e.charIndex, e.charLength ?? 1);
+				if (e.name === "word") {
+					// Translate sentence-relative position to full-text position
+					const globalStart = sentenceOffset + e.charIndex;
+					const wordLen = e.charLength ?? 1;
+					onWord(globalStart, wordLen);
+				}
 			};
 		}
 
@@ -282,10 +309,12 @@ function speakSmooth(
 			onDone();
 		};
 		speechSynthesis.speak(utter);
-		idx++;
 	}
 
-	speechSynthesis.speak(new SpeechSynthesisUtterance(""));
+	// Prime the speech synthesis engine (needed on some browsers)
+	const primer = new SpeechSynthesisUtterance("");
+	primer.volume = 0;
+	speechSynthesis.speak(primer);
 	setTimeout(() => {
 		idx = 0;
 		speakNext();
@@ -837,7 +866,7 @@ function App() {
 			} else if (cmd.includes("simplif") || cmd.includes("reading mode")) {
 				setPrefs((p) => ({ ...p, simplifiedReading: !p.simplifiedReading }));
 			} else if (cmd.includes("larger") || cmd.includes("bigger") || cmd.includes("zoom in")) {
-				setPrefs((p) => ({ ...p, fontSize: Math.min(p.fontSize + 2, 32) }));
+				setPrefs((p) => ({ ...p, fontSize: Math.min(p.fontSize + 2, 64) }));
 			} else if (cmd.includes("smaller") || cmd.includes("zoom out")) {
 				setPrefs((p) => ({ ...p, fontSize: Math.max(p.fontSize - 2, 12) }));
 			} else if (cmd.includes("faster") || cmd.includes("speed up")) {
@@ -1550,7 +1579,7 @@ function App() {
 				onCycleTheme={cycleTheme}
 				onToggleMagnifier={() => setPrefs((p) => ({ ...p, magnifierEnabled: !p.magnifierEnabled }))}
 				onToggleReading={() => setPrefs((p) => ({ ...p, simplifiedReading: !p.simplifiedReading }))}
-				onFontIncrease={() => setPrefs((p) => ({ ...p, fontSize: Math.min(p.fontSize + 2, 32) }))}
+				onFontIncrease={() => setPrefs((p) => ({ ...p, fontSize: Math.min(p.fontSize + 2, 64) }))}
 				onFontDecrease={() => setPrefs((p) => ({ ...p, fontSize: Math.max(p.fontSize - 2, 12) }))}
 				onOpenSettings={() => setActiveTab("settings")}
 			/>
@@ -1862,13 +1891,13 @@ function App() {
 											<Slider
 												id="font-size-sl"
 												min={12}
-												max={32}
+												max={64}
 												step={1}
 												value={[prefs.fontSize]}
 												onValueChange={([v]) => updatePref("fontSize", v)}
 											/>
 											<div className={cn("flex justify-between text-xs mt-1", themeSubText(t))}>
-												<span>12px</span><span>22px</span><span>32px</span>
+												<span>12px</span><span>38px</span><span>64px</span>
 											</div>
 										</div>
 
@@ -1948,16 +1977,19 @@ function App() {
 												</div>
 												<div>
 													<Label htmlFor="line-width-sl" className={cn("text-sm mb-2 block", themeText(t))}>
-														Max Width: {prefs.lineWidth}px
+														Max Width: {Math.min(prefs.lineWidth, 850)}px
 													</Label>
 													<Slider
 														id="line-width-sl"
 														min={400}
-														max={1200}
+														max={850}
 														step={50}
-														value={[prefs.lineWidth]}
-														onValueChange={([v]) => updatePref("lineWidth", v)}
+														value={[Math.min(prefs.lineWidth, 850)]}
+														onValueChange={([v]) => updatePref("lineWidth", Math.min(v, 850))}
 													/>
+													<div className={cn("flex justify-between text-xs mt-1", themeSubText(t))}>
+														<span>400px</span><span>625px</span><span>850px</span>
+													</div>
 												</div>
 											</>
 										)}
@@ -1974,30 +2006,39 @@ function App() {
 										</CardTitle>
 									</CardHeader>
 									<CardContent className="space-y-3">
-										{Object.entries(prefs.shortcuts).map(([action, shortcut]) => (
-											<div key={action} className="flex items-center justify-between gap-2">
-												<Label className={cn("text-sm capitalize flex-1", themeText(t))}>
-													{action.replace(/([A-Z])/g, " $1")}
-												</Label>
-												<input
-													type="text"
-													value={shortcut}
-													readOnly
-													onKeyDown={(e) => {
-														e.preventDefault();
-														const combo = `${e.altKey ? "Alt+" : ""}${e.ctrlKey ? "Ctrl+" : ""}${e.shiftKey ? "Shift+" : ""}${e.key.toUpperCase()}`;
-														if (e.key.length === 1 || ["F1","F2","F3","F4","F5","F6","F7","F8","F9","F10","F11","F12"].includes(e.key)) {
-															setPrefs((p) => ({ ...p, shortcuts: { ...p.shortcuts, [action]: combo } }));
-														}
-													}}
-													className={cn(
-														"w-24 text-center text-xs font-mono border rounded px-2 py-1 cursor-pointer focus:outline-none focus:ring-2 focus:ring-blue-500",
-														themeKbd(t),
-													)}
-													title="Click and press a key combination to change shortcut"
-												/>
-											</div>
-										))}
+										{Object.entries(prefs.shortcuts).map(([action, shortcut]) => {
+											const actionLabels: Record<string, string> = {
+												tts: "Text-to-Speech",
+												contrast: "Cycle Themes",
+												magnifier: "Magnifier (Alt+M)",
+												reading: "Reading Mode (Alt+R)",
+												voiceNav: "Voice Navigation",
+											};
+											return (
+												<div key={action} className="flex items-center justify-between gap-2">
+													<Label className={cn("text-sm flex-1", themeText(t))}>
+														{actionLabels[action] ?? action.replace(/([A-Z])/g, " $1")}
+													</Label>
+													<input
+														type="text"
+														value={shortcut}
+														readOnly
+														onKeyDown={(e) => {
+															e.preventDefault();
+															const combo = `${e.altKey ? "Alt+" : ""}${e.ctrlKey ? "Ctrl+" : ""}${e.shiftKey ? "Shift+" : ""}${e.key.toUpperCase()}`;
+															if (e.key.length === 1 || ["F1","F2","F3","F4","F5","F6","F7","F8","F9","F10","F11","F12"].includes(e.key)) {
+																setPrefs((p) => ({ ...p, shortcuts: { ...p.shortcuts, [action]: combo } }));
+															}
+														}}
+														className={cn(
+															"w-28 text-center text-xs font-mono border rounded px-2 py-1 cursor-pointer focus:outline-none focus:ring-2 focus:ring-blue-500",
+															themeKbd(t),
+														)}
+														title="Click and press a key combination to change shortcut"
+													/>
+												</div>
+											);
+										})}
 										<p className={cn("text-xs pt-2", themeSubText(t))}>Click a shortcut field and press a new key combination to customize it.</p>
 
 									{/* Keyboard Reference merged here */}
@@ -2910,7 +2951,7 @@ function App() {
 
 							<Card
 								className={cn(themeCard(t))}
-								style={prefs.simplifiedReading ? { maxWidth: `${prefs.lineWidth}px` } : undefined}
+								style={prefs.simplifiedReading ? { maxWidth: "850px" } : undefined}
 							>
 								<CardContent className="pt-4">
 									<p className={cn("text-xs mb-2", themeSubText(t))}>
@@ -2938,17 +2979,33 @@ function App() {
 											placeholder="Type or paste text here…"
 											aria-label="Editable sample text"
 										/>
-										{prefs.highlightAsRead && highlightRange && (
+										{/* Highlight-as-read: shows context window with current word highlighted */}
+										{prefs.highlightAsRead && ttsActive && highlightRange && (
 											<div
-												aria-hidden="true"
-												className="pointer-events-none absolute inset-0 overflow-hidden rounded-md"
-												style={{ fontSize: `${prefs.fontSize}px`, lineHeight: prefs.lineSpacing, padding: "0.5rem 0.75rem" }}
+												aria-live="polite"
+												aria-label="Currently reading"
+												className={cn(
+													"mt-2 rounded-lg px-3 py-2 text-sm border break-words",
+													t === "dark" && "bg-gray-800 border-blue-500 text-white",
+													t === "high-contrast" && "bg-black border-yellow-300 text-white",
+													t === "yellow-black" && "bg-yellow-100 border-black text-black",
+													t === "default" && "bg-blue-50 border-blue-300 text-gray-900",
+												)}
+												style={{ fontSize: `${prefs.fontSize}px`, lineHeight: prefs.lineSpacing, maxHeight: "120px", overflowY: "auto" }}
 											>
-												<span style={{ visibility: "hidden", whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
-													{sampleText.slice(0, highlightRange.start)}
+												<span style={{ opacity: 0.45 }}>
+													{sampleText.slice(Math.max(0, highlightRange.start - 80), highlightRange.start)}
 												</span>
-												<span style={{ background: "rgba(253,224,71,0.7)", borderRadius: "2px" }}>
+												<span style={{
+													background: t === "high-contrast" ? "rgba(250,204,21,0.9)" : t === "dark" ? "rgba(59,130,246,0.5)" : t === "yellow-black" ? "rgba(0,0,0,0.2)" : "rgba(253,224,71,0.8)",
+													borderRadius: "3px",
+													padding: "0 2px",
+													fontWeight: 700,
+												}}>
 													{sampleText.slice(highlightRange.start, highlightRange.end)}
+												</span>
+												<span style={{ opacity: 0.45 }}>
+													{sampleText.slice(highlightRange.end, Math.min(sampleText.length, highlightRange.end + 80))}
 												</span>
 											</div>
 										)}
@@ -3057,12 +3114,13 @@ function App() {
 // ─── Sub-components ────────────────────────────────────────────────────────────
 
 function MagnifierLens({ x, y, zoom }: { x: number; y: number; zoom: number }) {
-	const size = 200;
+	const size = 220;
 	const half = size / 2;
 
 	return (
 		<div
 			aria-hidden="true"
+			data-magnifier="true"
 			style={{
 				position: "fixed",
 				zIndex: 9998,
@@ -3075,20 +3133,19 @@ function MagnifierLens({ x, y, zoom }: { x: number; y: number; zoom: number }) {
 				boxShadow: "0 8px 32px rgba(0,0,0,0.55)",
 				overflow: "hidden",
 				pointerEvents: "none",
-				background: "#f9fafb",
 			}}
 		>
-			{/* Magnified view via CSS filter trick – we position a window into the page */}
+			{/* Use a scaled clone of the body via CSS transform */}
 			<MagnifiedFrame x={x} y={y} zoom={zoom} size={size} />
 			{/* Crosshair */}
 			<div style={{ position: "absolute", inset: 0, pointerEvents: "none", zIndex: 2 }}>
-				<div style={{ position: "absolute", left: half - 0.5, top: 0, bottom: 0, width: 1, background: "rgba(59,130,246,0.5)" }} />
-				<div style={{ position: "absolute", top: half - 0.5, left: 0, right: 0, height: 1, background: "rgba(59,130,246,0.5)" }} />
+				<div style={{ position: "absolute", left: half - 0.5, top: 0, bottom: 0, width: 1, background: "rgba(59,130,246,0.4)" }} />
+				<div style={{ position: "absolute", top: half - 0.5, left: 0, right: 0, height: 1, background: "rgba(59,130,246,0.4)" }} />
 			</div>
 			{/* Zoom badge */}
 			<div style={{
 				position: "absolute", bottom: 6, right: 10, fontSize: 10, fontWeight: 700,
-				color: "#3b82f6", fontFamily: "monospace", background: "rgba(255,255,255,0.9)",
+				color: "#3b82f6", fontFamily: "monospace", background: "rgba(255,255,255,0.85)",
 				borderRadius: 3, padding: "1px 4px", zIndex: 3, pointerEvents: "none",
 			}}>
 				{zoom}×
@@ -3098,76 +3155,56 @@ function MagnifierLens({ x, y, zoom }: { x: number; y: number; zoom: number }) {
 }
 
 function MagnifiedFrame({ x, y, zoom, size }: { x: number; y: number; zoom: number; size: number }) {
-	const canvasRef = React.useRef<HTMLCanvasElement>(null);
-	const rafRef = React.useRef<number>(0);
-	const half = size / 2;
+	const containerRef = React.useRef<HTMLDivElement>(null);
 
 	React.useEffect(() => {
-		cancelAnimationFrame(rafRef.current);
-		rafRef.current = requestAnimationFrame(() => {
-			const canvas = canvasRef.current;
-			if (!canvas) return;
-			const dpr = window.devicePixelRatio || 1;
-			canvas.width = size * dpr;
-			canvas.height = size * dpr;
-			const ctx = canvas.getContext("2d");
-			if (!ctx) return;
-			ctx.scale(dpr, dpr);
+		const container = containerRef.current;
+		if (!container) return;
 
-			// Region of page to sample: size/zoom pixels around cursor
-			const regionW = Math.ceil(size / zoom);
-			const regionH = Math.ceil(size / zoom);
-			const startX = x - regionW / 2;
-			const startY = y - regionH / 2;
-			const cellW = size / regionW;
-			const cellH = size / regionH;
+		// Clone the entire body except for the magnifier itself
+		const bodyClone = document.body.cloneNode(true) as HTMLElement;
+		// Remove the magnifier from the clone to prevent infinite recursion
+		const magnifiers = bodyClone.querySelectorAll("[data-magnifier]");
+		magnifiers.forEach((el) => el.remove());
 
-			for (let row = 0; row < regionH; row++) {
-				for (let col = 0; col < regionW; col++) {
-					const px = startX + col;
-					const py = startY + row;
-					// Temporarily hide magnifier element to avoid self-sampling
-					const el = document.elementFromPoint(px, py) as HTMLElement | null;
-					let fillColor = "#f9fafb";
-					if (el) {
-						const cs = window.getComputedStyle(el);
-						const bg = cs.backgroundColor;
-						if (bg && bg !== "rgba(0, 0, 0, 0)" && bg !== "transparent") {
-							fillColor = bg;
-						} else {
-							// Walk up DOM to find a background
-							let parent = el.parentElement;
-							while (parent) {
-								const parentBg = window.getComputedStyle(parent).backgroundColor;
-								if (parentBg && parentBg !== "rgba(0, 0, 0, 0)" && parentBg !== "transparent") {
-									fillColor = parentBg;
-									break;
-								}
-								parent = parent.parentElement;
-							}
-						}
-					}
-					ctx.fillStyle = fillColor;
-					ctx.fillRect(col * cellW, row * cellH, Math.ceil(cellW) + 1, Math.ceil(cellH) + 1);
+		// Apply all computed styles
+		bodyClone.style.margin = "0";
+		bodyClone.style.padding = "0";
+		bodyClone.style.overflow = "hidden";
+		bodyClone.style.width = `${window.innerWidth}px`;
+		bodyClone.style.height = `${window.innerHeight}px`;
+		bodyClone.style.position = "absolute";
+		bodyClone.style.top = "0";
+		bodyClone.style.left = "0";
+		bodyClone.style.transform = `scale(${zoom})`;
+		bodyClone.style.transformOrigin = "0 0";
+		// Offset so the cursor position maps to the center of the lens
+		const half = size / 2;
+		const offsetX = -(x * zoom - half);
+		const offsetY = -(y * zoom - half);
+		bodyClone.style.marginLeft = `${offsetX}px`;
+		bodyClone.style.marginTop = `${offsetY}px`;
+		bodyClone.style.pointerEvents = "none";
 
-					// Draw text character if leaf text node
-					if (el && el.childNodes.length > 0) {
-						const textNode = Array.from(el.childNodes).find((n) => n.nodeType === Node.TEXT_NODE && n.textContent?.trim());
-						if (textNode) {
-							const cs = window.getComputedStyle(el);
-							ctx.fillStyle = cs.color || "#000";
-							const fontSize = Math.max(cellH * 0.7, 7);
-							ctx.font = `${fontSize}px ${cs.fontFamily || "sans-serif"}`;
-							ctx.fillText(textNode.textContent?.trim().slice(0, 2) ?? "", col * cellW + 1, (row + 1) * cellH - 1);
-						}
-					}
-				}
-			}
-		});
-		return () => cancelAnimationFrame(rafRef.current);
-	}, [x, y, zoom, size, half]);
+		container.innerHTML = "";
+		container.appendChild(bodyClone);
 
-	return <canvas ref={canvasRef} style={{ width: size, height: size, display: "block" }} />;
+		return () => {
+			container.innerHTML = "";
+		};
+	}, [x, y, zoom, size]);
+
+	return (
+		<div
+			ref={containerRef}
+			style={{
+				width: size,
+				height: size,
+				overflow: "hidden",
+				position: "relative",
+			}}
+		/>
+	);
 }
 
 interface ToolbarProps {
