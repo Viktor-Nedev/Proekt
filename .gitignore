@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.build/
+*.local
+.claude/
+.claude.user/
+config/
+spec/
