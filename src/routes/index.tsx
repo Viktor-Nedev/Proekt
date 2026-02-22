@@ -240,7 +240,7 @@ function speakSmooth(
 
 	// Split text into sentences, but track their offsets in the original text
 	const rawSentences = text
-		.replace(/([.!?])\s+/g, "$1\n")
+		.replace(/([.!?。！？])\s+/g, "$1\n")
 		.split("\n")
 		.map((s) => s.trim())
 		.filter(Boolean);
@@ -260,22 +260,30 @@ function speakSmooth(
 	}
 
 	const preferredKeywords = ["natural", "enhanced", "neural", "premium", "google", "microsoft"];
-	const langVoices = voices.filter((v) => v.lang.startsWith(lang.slice(0, 2)));
+	// Try to match on first two chars of lang code (e.g. "en" for "en-US")
+	const langCode = lang.slice(0, 2).toLowerCase();
+	// Get voices fresh if the cached list is empty (browsers load voices asynchronously)
+	const allVoices = voices.length > 0 ? voices : speechSynthesis.getVoices();
+	const langVoices = allVoices.filter((v) => v.lang.toLowerCase().startsWith(langCode));
+	// Fall back to all voices if none match
+	const candidateVoices = langVoices.length > 0 ? langVoices : allVoices;
 
 	let chosenVoice: SpeechSynthesisVoice | null = null;
 	if (voiceName) {
-		chosenVoice = langVoices.find((v) => v.name === voiceName) ?? null;
+		chosenVoice = candidateVoices.find((v) => v.name === voiceName) ?? null;
 	}
 	if (!chosenVoice) {
 		chosenVoice =
-			langVoices.find((v) =>
+			candidateVoices.find((v) =>
 				preferredKeywords.some((kw) => v.name.toLowerCase().includes(kw)),
-			) ?? langVoices[0] ?? null;
+			) ?? candidateVoices[0] ?? null;
 	}
 
 	let idx = 0;
+	let cancelled = false;
 
 	function speakNext() {
+		if (cancelled) return;
 		if (idx >= rawSentences.length) {
 			onDone();
 			return;
@@ -288,37 +296,40 @@ function speakSmooth(
 		utter.rate = speed;
 		utter.lang = lang;
 		utter.pitch = 1.05;
+		utter.volume = 1;
 		if (chosenVoice) utter.voice = chosenVoice;
 
 		if (onWord) {
-			utter.onboundary = (e) => {
+			utter.onboundary = (e: SpeechSynthesisEvent) => {
 				if (e.name === "word") {
 					// Translate sentence-relative position to full-text position
-					const globalStart = sentenceOffset + e.charIndex;
-					const wordLen = e.charLength ?? 1;
+					const globalStart = sentenceOffset + (e.charIndex ?? 0);
+					const wordLen = (e.charLength ?? 0) > 0 ? e.charLength : Math.max(1, sentence.slice(e.charIndex ?? 0).search(/\s|$/) || 1);
 					onWord(globalStart, wordLen);
 				}
 			};
 		}
 
 		utter.onend = () => {
+			if (cancelled) return;
 			idx++;
 			speakNext();
 		};
-		utter.onerror = () => {
+		utter.onerror = (e: SpeechSynthesisErrorEvent) => {
+			// "interrupted" is normal when cancel() is called, don't treat as error
+			if (e.error === "interrupted" || e.error === "canceled") return;
 			onDone();
 		};
 		speechSynthesis.speak(utter);
 	}
 
-	// Prime the speech synthesis engine (needed on some browsers)
-	const primer = new SpeechSynthesisUtterance("");
-	primer.volume = 0;
-	speechSynthesis.speak(primer);
+	// Small delay to let speechSynthesis.cancel() flush before starting new speech
 	setTimeout(() => {
-		idx = 0;
-		speakNext();
-	}, 50);
+		if (!cancelled) speakNext();
+	}, 100);
+
+	// Return a cancel function (used internally)
+	return () => { cancelled = true; };
 }
 
 // ─── File text extraction ─────────────────────────────────────────────────────
@@ -491,7 +502,7 @@ function App() {
 	const cameraRecognitionRef = React.useRef<{ stop: () => void } | null>(null);
 
 	// Page navigation state: "content" | "camera" | "games" | "signlanguage"
-	const [activePage, setActivePage] = React.useState<"content" | "camera" | "games" | "signlanguage">("content");
+	const [activePage, setActivePage] = React.useState<"content" | "camera" | "games" | "signlanguage" | "about">("content");
 
 	// ── Games state ──────────────────────────────────────────────────────────
 	// Colorblind number recognition game
@@ -838,44 +849,100 @@ function App() {
 			// Camera page commands when voice nav is active
 			if (cmd.includes("open camera") || cmd.includes("start camera") || cmd.includes("camera on")) {
 				setActivePage("camera");
-				startCamera();
-			} else if (cmd.includes("take photo") || cmd.includes("capture") || cmd.includes("snap")) {
+				if (!cameraActive) startCamera();
+			} else if (
+				cmd.includes("take photo") || cmd.includes("capture") || cmd.includes("snap") ||
+				cmd.includes("направи снимка") || cmd.includes("заснеми") || cmd.includes("снимка")
+			) {
 				setActivePage("camera");
-				analyseCapture();
+				if (!cameraActive) {
+					// Start camera then analyse after it's ready
+					startCamera().then(() => {
+						setTimeout(() => analyseCapture(), 800);
+					});
+				} else {
+					analyseCapture();
+				}
+			} else if (
+				cmd.includes("describe") || cmd.includes("what do you see") || cmd.includes("analyze image") ||
+				cmd.includes("describe photo") || cmd.includes("describe picture") ||
+				cmd.includes("опиши снимката") || cmd.includes("опиши")
+			) {
+				setActivePage("camera");
+				if (capturedImage) {
+					// Re-analyse the captured image
+					analyseCapture();
+				} else if (cameraActive) {
+					analyseCapture();
+				}
 			} else if (cmd.includes("stop camera") || cmd.includes("close camera") || cmd.includes("camera off")) {
 				stopCamera();
-			} else if (cmd.includes("read") || cmd.includes("speak")) {
+			} else if (
+				cmd.includes("read") || cmd.includes("speak") || cmd.includes("play") ||
+				cmd.includes("чети") || cmd.includes("прочети")
+			) {
 				const sel = window.getSelection()?.toString().trim();
-				handleTtsStart(sel || sampleText);
-				setTtsActive(true);
-			} else if (cmd.includes("stop") || cmd.includes("quiet")) {
+				const textToRead = sel || sampleText;
+				if (textToRead.trim()) {
+					handleTtsStart(textToRead);
+				} else {
+					// Speak a helpful message if no text is loaded
+					const utter = new SpeechSynthesisUtterance("Please load some text first, then say read.");
+					utter.lang = "en-US";
+					utter.volume = 1;
+					speechSynthesis.speak(utter);
+				}
+			} else if (cmd.includes("stop") || cmd.includes("quiet") || cmd.includes("спри")) {
 				speechSynthesis.cancel();
 				setTtsActive(false);
 				setTtsPaused(false);
-			} else if (cmd.includes("pause")) {
-				speechSynthesis.pause();
-				setTtsPaused(true);
-			} else if (cmd.includes("dark mode")) {
+				setHighlightRange(null);
+			} else if (cmd.includes("pause") || cmd.includes("пауза")) {
+				if (ttsPaused) {
+					speechSynthesis.resume();
+					setTtsPaused(false);
+				} else {
+					speechSynthesis.pause();
+					setTtsPaused(true);
+				}
+			} else if (cmd.includes("resume") || cmd.includes("continue")) {
+				speechSynthesis.resume();
+				setTtsPaused(false);
+			} else if (cmd.includes("dark mode") || cmd.includes("тъмен")) {
 				setPrefs((p) => ({ ...p, theme: "dark" }));
-			} else if (cmd.includes("high contrast")) {
+			} else if (cmd.includes("high contrast") || cmd.includes("висок контраст")) {
 				setPrefs((p) => ({ ...p, theme: "high-contrast" }));
-			} else if (cmd.includes("light mode") || cmd.includes("default")) {
+			} else if (cmd.includes("light mode") || cmd.includes("default") || cmd.includes("светъл")) {
 				setPrefs((p) => ({ ...p, theme: "default" }));
-			} else if (cmd.includes("magnif")) {
+			} else if (cmd.includes("yellow") || cmd.includes("жълт")) {
+				setPrefs((p) => ({ ...p, theme: "yellow-black" }));
+			} else if (cmd.includes("magnif") || cmd.includes("лупа")) {
 				setPrefs((p) => ({ ...p, magnifierEnabled: !p.magnifierEnabled }));
-			} else if (cmd.includes("simplif") || cmd.includes("reading mode")) {
+			} else if (cmd.includes("simplif") || cmd.includes("reading mode") || cmd.includes("режим четене")) {
 				setPrefs((p) => ({ ...p, simplifiedReading: !p.simplifiedReading }));
-			} else if (cmd.includes("larger") || cmd.includes("bigger") || cmd.includes("zoom in")) {
+			} else if (cmd.includes("larger") || cmd.includes("bigger") || cmd.includes("zoom in") || cmd.includes("по-голям")) {
 				setPrefs((p) => ({ ...p, fontSize: Math.min(p.fontSize + 2, 64) }));
-			} else if (cmd.includes("smaller") || cmd.includes("zoom out")) {
+			} else if (cmd.includes("smaller") || cmd.includes("zoom out") || cmd.includes("по-малък")) {
 				setPrefs((p) => ({ ...p, fontSize: Math.max(p.fontSize - 2, 12) }));
-			} else if (cmd.includes("faster") || cmd.includes("speed up")) {
+			} else if (cmd.includes("faster") || cmd.includes("speed up") || cmd.includes("по-бързо")) {
 				setPrefs((p) => ({ ...p, ttsSpeed: Math.min(p.ttsSpeed + 0.25, 3) }));
-			} else if (cmd.includes("slower") || cmd.includes("slow down")) {
+			} else if (cmd.includes("slower") || cmd.includes("slow down") || cmd.includes("по-бавно")) {
 				setPrefs((p) => ({ ...p, ttsSpeed: Math.max(p.ttsSpeed - 0.25, 0.5) }));
+			} else if (cmd.includes("scroll down") || cmd.includes("down")) {
+				window.scrollBy({ top: 300, behavior: "smooth" });
+			} else if (cmd.includes("scroll up") || cmd.includes("up")) {
+				window.scrollBy({ top: -300, behavior: "smooth" });
+			} else if (cmd.includes("go home") || cmd.includes("home") || cmd.includes("начало")) {
+				setActivePage("content");
+			} else if (cmd.includes("go to camera") || cmd.includes("camera page")) {
+				setActivePage("camera");
+			} else if (cmd.includes("go to sign") || cmd.includes("sign language")) {
+				setActivePage("signlanguage");
+			} else if (cmd.includes("go to games") || cmd.includes("games")) {
+				setActivePage("games");
 			}
 		},
-		[handleTtsStart, sampleText],
+		[handleTtsStart, sampleText, cameraActive, capturedImage, ttsPaused],
 	);
 
 	const handleVoiceNavToggle = React.useCallback(() => {
@@ -958,6 +1025,9 @@ function App() {
 	function stopCamera() {
 		streamRef.current?.getTracks().forEach((t) => t.stop());
 		streamRef.current = null;
+		if (videoRef.current) {
+			videoRef.current.srcObject = null;
+		}
 		setCameraActive(false);
 	}
 
@@ -1103,6 +1173,10 @@ function App() {
 	React.useEffect(() => {
 		return () => {
 			streamRef.current?.getTracks().forEach((t) => t.stop());
+			streamRef.current = null;
+			if (videoRef.current) {
+				videoRef.current.srcObject = null;
+			}
 		};
 	}, []);
 
@@ -2178,6 +2252,24 @@ function App() {
 						>
 							<Hand size={16} /> Sign Language
 						</button>
+						<button
+							type="button"
+							onClick={() => setActivePage("about")}
+							className={cn(
+								"flex items-center gap-2 px-4 py-2 rounded-xl border font-semibold text-sm transition-all focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:outline-none",
+								activePage === "about"
+									? "bg-indigo-600 text-white border-indigo-700 shadow-md"
+									: cn(
+										"hover:border-indigo-300 hover:shadow-sm",
+										t === "dark" && "bg-gray-800 border-gray-600 text-white",
+										t === "high-contrast" && "bg-gray-900 border-white text-white",
+										t === "yellow-black" && "bg-yellow-300 border-black text-black",
+										t === "default" && "bg-white border-gray-200 text-gray-700",
+									),
+							)}
+						>
+							<Sparkles size={16} /> About Claryx
+						</button>
 					</div>
 
 					{/* Quick actions */}
@@ -2878,11 +2970,18 @@ function App() {
 									<Button
 										size="sm"
 										variant={ttsActive ? "default" : "outline"}
-										onClick={handleTtsToggle}
+										onClick={() => {
+											if (ttsActive) {
+												handleTtsStop();
+											} else {
+												const text = sampleText.trim();
+												if (text) handleTtsStart(text);
+											}
+										}}
 										className={cn(!ttsActive && themeOutlineBtn(t))}
 									>
 										<Volume2 size={14} className="mr-1" />
-										{ttsActive ? "Stop" : "Read"}
+										{ttsActive ? "Stop" : "Read Aloud"}
 									</Button>
 								</div>
 							</div>
@@ -3104,6 +3203,59 @@ function App() {
 						</div>
 					</section>
 						</section>}
+
+					{/* About Claryx Page */}
+					{activePage === "about" && (
+						<section aria-labelledby="about-heading" className="space-y-6">
+							<div className="flex items-center gap-3 mb-2">
+								<Sparkles size={24} className={cn(t === "high-contrast" ? "text-yellow-300" : t === "dark" ? "text-indigo-400" : "text-indigo-600")} />
+								<h2 id="about-heading" className={cn("text-2xl font-bold tracking-tight", themeText(t))}>About Claryx</h2>
+							</div>
+
+							{[
+								{
+									title: "Inspiration",
+									content: "We built Claryx because accessibility on the web is still an afterthought for too many people. Every day, millions of users with visual impairments, reading difficulties, motor disabilities, or cognitive differences struggle with content that simply wasn't designed with them in mind. We wanted to change that — not with a narrow single-feature tool, but with a comprehensive, all-in-one platform that actually meets people where they are. The name Claryx comes from clarity — the goal of making information clear, readable, and reachable for everyone, regardless of ability.",
+								},
+								{
+									title: "What it does",
+									content: "Claryx is an accessibility hub that brings together a wide range of assistive tools in a single, cohesive interface. Users can listen to any text read aloud with natural-sounding voices and multi-language support, import documents (PDF, DOCX, TXT, and images via OCR), and get AI-powered summaries of long content. The platform offers adaptive display modes — high contrast, dark mode, yellow-on-black — alongside adjustable font size, line spacing, and a distraction-free reading layout. A magnifier follows the cursor for low-vision users, while voice navigation lets users control the interface hands-free. For users with color vision deficiency, Claryx includes an Ishihara-style colorblind game for awareness and testing. A sign language recognition module captures live video and transcribes signed input. Annotations let users highlight and annotate any text passage, and everything can be exported as a plain-text file.",
+								},
+								{
+									title: "How we built it",
+									content: "Claryx is built on React 19 with TypeScript, using TanStack Router for file-based routing and TanStack Query for server-state management. The UI is composed of Tailwind CSS v4 and shadcn/ui components styled for every accessibility theme. Text-to-speech is powered by the Web Speech API with custom word-boundary tracking for real-time highlighting. Voice navigation uses the SpeechRecognition API. File parsing leverages pdfjs-dist for PDFs and Mammoth for DOCX files, while image OCR and AI summarization are handled through the OpenAI GPT Vision API. The colorblind game renders procedurally generated Ishihara-style SVG plates. Sign language capture uses the MediaRecorder API combined with vision-based frame analysis.",
+								},
+								{
+									title: "Challenges we ran into",
+									content: "Voice APIs vary significantly across browsers — Chrome, Firefox, and Safari each expose speech synthesis voices differently and at different lifecycle moments, requiring careful async initialization. Getting the camera to release properly when switching pages was tricky: stopping all MediaStream tracks is not enough if the video element still holds a reference to the stream. Multi-language TTS required detecting the language of pasted or uploaded text before selecting an appropriate voice, which needed both heuristic detection and graceful fallbacks. Rendering accessible, high-contrast Ishihara plates in SVG while maintaining the visual complexity needed to challenge users took multiple iterations. Balancing the breadth of features with a clean, non-overwhelming UI was an ongoing design challenge throughout the hackathon.",
+								},
+								{
+									title: "Accomplishments that we're proud of",
+									content: "We're proud that Claryx is not a demo — it's a fully working accessibility platform built end-to-end during the hackathon. Every feature functions with real user input: actual PDF parsing, real voice synthesis, live camera OCR, and a genuinely playable colorblind game with difficulty levels and scoring. We shipped multi-language TTS with automatic language detection, a keyboard-shortcut system, a draggable floating toolbar, four distinct accessibility themes, and a persistent annotation system — all in a single cohesive interface. We're especially proud of how the different tools complement each other rather than feeling bolted together.",
+								},
+								{
+									title: "What we learned",
+									content: "We learned how deep the browser accessibility APIs go — and how inconsistently they are implemented. The Web Speech API alone required us to handle a dozen edge cases around voice loading, utterance queuing, pause/resume behavior, and cross-browser quirks. We also learned that good accessibility is fundamentally about respecting user agency: giving people control over fonts, contrast, speed, language, and layout — not making those decisions for them. Building for accessibility from day one changes how you think about every UI decision, from color choices to focus management to ARIA roles.",
+								},
+								{
+									title: "What's next for Claryx",
+									content: "We plan to expand Claryx with persistent user profiles so that preferences — themes, voice settings, font sizes, shortcuts — are saved across sessions. We want to add real-time collaborative annotation so teachers and students can work with the same document together. The sign language module will be extended with a full model-backed recognition pipeline. We're also exploring browser-extension packaging so Claryx's tools can be applied to any webpage, not just uploaded content. Long term, we envision Claryx as an open platform where accessibility plugins can be contributed by the community.",
+								},
+							].map(({ title, content }) => (
+								<Card key={title} className={cn(themeCard(t))}>
+									<CardHeader className="pb-2">
+										<CardTitle className={cn("text-base font-semibold", themeText(t))}>
+											## {title}
+										</CardTitle>
+									</CardHeader>
+									<CardContent>
+										<p className={cn("text-sm leading-relaxed", themeSubText(t))}>{content}</p>
+									</CardContent>
+								</Card>
+							))}
+						</section>
+					)}
+
 					</main>
 				</div>
 			</div>
